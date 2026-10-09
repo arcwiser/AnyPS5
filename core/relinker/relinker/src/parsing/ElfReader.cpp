@@ -130,6 +130,17 @@ std::vector<ProgramHeader> ElfReader::ReadProgramHeaders() const {
 
 std::vector<SectionHeader> ElfReader::ReadSectionHeaders() const {
     const ElfHeader header = ReadHeader();
+    if (header.SectionHeaderCount != 0 && header.SectionHeaderEntrySize != 64) {
+        throw RelinkerException("Invalid ELF section header entry size: expected 64 bytes", 0x3a);
+    }
+    if (header.SectionHeaderStringIndex >= header.SectionHeaderCount && header.SectionHeaderStringIndex != 0) {
+        throw RelinkerException("ELF section name string table index is out of bounds", 0x3e);
+    }
+    if (!_rangeFits(header.SectionHeaderOffset,
+                    static_cast<std::uint64_t>(header.SectionHeaderCount) * header.SectionHeaderEntrySize,
+                    _fileBuffer.size())) {
+        throw RelinkerException("ELF section header table is out of bounds", header.SectionHeaderOffset);
+    }
 
     std::vector<SectionHeader> headers;
     FileByteOffset offset = header.SectionHeaderOffset;
@@ -164,13 +175,24 @@ std::string ElfReader::_resolveShdrName(std::uint32_t nameOffset, const ElfHeade
                         (header.SectionHeaderStringIndex * header.SectionHeaderEntrySize);
 
     const FileByteOffset strTableOffset = _readU64At(shstrOffset + 0x18);
+    const ByteCount strTableSize = _readU64At(shstrOffset + 0x20);
+    if (!_rangeFits(strTableOffset, strTableSize, _fileBuffer.size())) {
+        throw RelinkerException("ELF section name string table is out of bounds", strTableOffset);
+    }
+    if (nameOffset >= strTableSize) {
+        throw RelinkerException("ELF section name offset is out of bounds", nameOffset);
+    }
 
     std::string name;
     FileByteOffset currentPos = strTableOffset + nameOffset;
+    const FileByteOffset end = strTableOffset + strTableSize;
 
-    while (currentPos < _fileBuffer.size() && _fileBuffer[currentPos] != '\0') {
+    while (currentPos < end && _fileBuffer[currentPos] != '\0') {
         name += static_cast<char>(_fileBuffer[currentPos]);
         currentPos++;
+    }
+    if (currentPos == end) {
+        throw RelinkerException("ELF section name is not NUL-terminated within its string table", nameOffset);
     }
 
     return name;
