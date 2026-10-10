@@ -1090,6 +1090,21 @@ void cmaskTests() {
     Require(texels(0x5a5a5a5au), "a refused pass changed the texels of a DCC target");
 }
 
+void uint16ExportTests() {
+    auto queue = makeState();
+    queue.context[0x1c5] = 7;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "color export format 7");
+    queue.context[0x31c] = (queue.context[0x31c] & ~0x77cu) | 0x404u;
+    const auto state = AgcDriver::Graphics::DecodeState(queue);
+    Require(state.hasColorTarget && state.color.format == VK_FORMAT_R8_UINT && state.color.uintExport, "a UINT16_ABGR export into an unsigned integer target did not decode");
+    Require(!AgcDriver::Graphics::DecodeState(makeState()).color.uintExport, "a float export was marked unsigned integer");
+    auto blended = queue;
+    blended.context[0x1e0] = 1u << 30u;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(blended); }, "blending into an unsigned integer target");
+    queue.context[0x1c5] = 8;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "color export format 8");
+}
+
 void DepthClipTests() {
     auto queue = makeState();
     const auto direct = AgcDriver::Graphics::DecodeState(queue);
@@ -1178,6 +1193,10 @@ struct MockVulkan {
     std::map<VkDeviceMemory, VkMemoryAllocateFlags> allocationFlags;
     std::map<VkBuffer, VkDeviceMemory> bufferMemory;
     std::map<VkDeviceMemory, std::vector<std::byte>> memories;
+    std::map<VkDeviceMemory, VkDeviceSize> allocationSizes;
+    VkDeviceSize allocatedBytes = 0;
+    std::optional<VkDeviceSize> memoryLimit;
+    std::uint64_t allocationAttempts = 0;
     std::vector<VkDescriptorSetLayoutBinding> layoutBindings;
     std::vector<VkDescriptorPoolSize> poolSizes;
     std::uint32_t poolMaxSets = 0;
@@ -1217,8 +1236,12 @@ VKAPI_ATTR void VKAPI_CALL mockGetBufferMemoryRequirements(VkDevice, VkBuffer bu
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockAllocateMemory(VkDevice, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks*, VkDeviceMemory* memory) {
+    ++mock.allocationAttempts;
+    if (mock.memoryLimit.has_value() && mock.allocatedBytes + info->allocationSize > *mock.memoryLimit) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     *memory = makeHandle<VkDeviceMemory>();
     mock.memories[*memory] = std::vector<std::byte>(info->allocationSize);
+    mock.allocationSizes[*memory] = info->allocationSize;
+    mock.allocatedBytes += info->allocationSize;
     if (info->pNext != nullptr) {
         const auto* flags = static_cast<const VkMemoryAllocateFlagsInfo*>(info->pNext);
         mock.allocationFlags[*memory] = flags->flags;
@@ -1246,7 +1269,11 @@ VKAPI_ATTR void VKAPI_CALL mockDestroyBuffer(VkDevice, VkBuffer, const VkAllocat
     --mock.live;
 }
 
-VKAPI_ATTR void VKAPI_CALL mockFreeMemory(VkDevice, VkDeviceMemory, const VkAllocationCallbacks*) {
+VKAPI_ATTR void VKAPI_CALL mockFreeMemory(VkDevice, VkDeviceMemory memory, const VkAllocationCallbacks*) {
+    if (const auto found = mock.allocationSizes.find(memory); found != mock.allocationSizes.end()) {
+        mock.allocatedBytes -= found->second;
+        mock.allocationSizes.erase(found);
+    }
     --mock.live;
 }
 
@@ -1298,6 +1325,12 @@ VKAPI_ATTR void VKAPI_CALL mockCmdBindDescriptorSets(VkCommandBuffer, VkPipeline
     mock.boundPoint = point;
     mock.boundFirst = first;
     mock.boundSets = count;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL mockGetMemoryHostPointerProperties(VkDevice, VkExternalMemoryHandleTypeFlagBits type, const void* pointer, VkMemoryHostPointerPropertiesEXT* properties) {
+    Require(type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT && pointer != nullptr, "invalid host pointer import query");
+    properties->memoryTypeBits = 1;
+    return VK_SUCCESS;
 }
 
 VKAPI_ATTR VkDeviceAddress VKAPI_CALL mockGetBufferDeviceAddress(VkDevice, const VkBufferDeviceAddressInfo* info) {
@@ -1369,6 +1402,7 @@ VKAPI_ATTR void VKAPI_CALL mockCmdUpdateBuffer(VkCommandBuffer, VkBuffer buffer,
 PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
     static const std::map<std::string_view, PFN_vkVoidFunction> table{
         {"vkGetBufferDeviceAddressKHR", reinterpret_cast<PFN_vkVoidFunction>(mockGetBufferDeviceAddress)},
+        {"vkGetMemoryHostPointerPropertiesEXT", reinterpret_cast<PFN_vkVoidFunction>(mockGetMemoryHostPointerProperties)},
         {"vkCreateBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockCreateBuffer)},
         {"vkGetBufferMemoryRequirements", reinterpret_cast<PFN_vkVoidFunction>(mockGetBufferMemoryRequirements)},
         {"vkAllocateMemory", reinterpret_cast<PFN_vkVoidFunction>(mockAllocateMemory)},
@@ -1724,6 +1758,63 @@ void descriptorCacheTests() {
     Require(mock.live == 0, "the descriptor cache leaked a pool or layout");
 }
 
+void textureCacheBudgetTests() {
+    using AgcDriver::Graphics::TextureCacheBudget;
+    constexpr std::uint64_t GiB = 1ull << 30u;
+    VkPhysicalDeviceMemoryProperties memory{};
+    Require(TextureCacheBudget(memory) == 2 * GiB, "a device without memory heaps does not keep 2 GiB of cached textures");
+    memory.memoryHeapCount = 3;
+    memory.memoryHeaps[0] = {256ull << 20u, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+    memory.memoryHeaps[1] = {32 * GiB, 0};
+    memory.memoryHeaps[2] = {16 * GiB, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT | VK_MEMORY_HEAP_MULTI_INSTANCE_BIT};
+    Require(TextureCacheBudget(memory) == 4 * GiB, "a 16 GiB device-local heap does not give 4 GiB of cached textures");
+    memory.memoryHeaps[2].size = 6 * GiB;
+    Require(TextureCacheBudget(memory) == 2 * GiB, "a 6 GiB device-local heap does not keep the 2 GiB floor");
+    memory.memoryHeaps[2].size = 24 * GiB;
+    memory.memoryHeapCount = 2;
+    Require(TextureCacheBudget(memory) == 2 * GiB, "a heap past memoryHeapCount or a host heap counted toward the texture caches");
+    memory.memoryHeapCount = 3;
+    Require(TextureCacheBudget(memory) == 6 * GiB, "a 24 GiB device-local heap does not give 6 GiB of cached textures");
+}
+
+void sampledTextureBudgetTests() {
+    using AgcDriver::Graphics::SampledTextureBudget;
+    constexpr std::uint64_t GiB = 1ull << 30u;
+    constexpr std::uint64_t MiB = 1ull << 20u;
+    VkPhysicalDeviceMemoryProperties memory{};
+    memory.memoryHeapCount = 3;
+    memory.memoryHeaps[0] = {256 * MiB, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+    memory.memoryHeaps[1] = {32 * GiB, 0};
+    memory.memoryHeaps[2] = {16 * GiB, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    Require(SampledTextureBudget(memory, nullptr, 0) == 4 * GiB, "without VK_EXT_memory_budget the sampled texture cache does not keep a quarter of the 16 GiB heap");
+    reported.heapBudget[0] = 100 * GiB;
+    reported.heapBudget[1] = 100 * GiB;
+    Require(SampledTextureBudget(memory, &reported, 0) == 4 * GiB, "a zero budget for the largest device-local heap did not fall back to a quarter of the heap");
+    reported.heapBudget[2] = 15 * GiB;
+    reported.heapUsage[2] = 9 * GiB;
+    Require(SampledTextureBudget(memory, &reported, 5 * GiB) == 5 * GiB + 128 * MiB, "a 15 GiB budget with 4 GiB used outside the texture caches does not leave 5 GiB 128 MiB after the 4 GiB storage cache and 1 GiB 896 MiB of headroom");
+    reported.heapUsage[2] = 3 * GiB;
+    Require(SampledTextureBudget(memory, &reported, 5 * GiB) == 9 * GiB + 128 * MiB, "usage below the cached bytes is not read as no other device memory in use");
+    reported.heapUsage[2] = 12 * GiB;
+    Require(SampledTextureBudget(memory, &reported, 1 * GiB) == 2 * GiB, "a heap whose other users leave no room does not keep the 2 GiB floor");
+    memory.memoryHeaps[0].flags = 0;
+    memory.memoryHeaps[2].flags = 0;
+    Require(SampledTextureBudget(memory, &reported, 0) == 2 * GiB, "a device without a device-local heap does not keep 2 GiB of sampled textures");
+}
+
+void sampledBudgetReportTests() {
+    using AgcDriver::Graphics::SampledBudgetReportDue;
+    using std::chrono::seconds;
+    constexpr std::uint64_t MiB = 1ull << 20u;
+    Require(SampledBudgetReportDue(0, 2048 * MiB, seconds(10)), "a budget never reported is not due");
+    Require(!SampledBudgetReportDue(4000 * MiB, 4400 * MiB, seconds(60)), "a budget 10% above the reported one is due, not only one more than 10% away");
+    Require(!SampledBudgetReportDue(4000 * MiB, 3600 * MiB, seconds(60)), "a budget 10% below the reported one is due, not only one more than 10% away");
+    Require(SampledBudgetReportDue(4000 * MiB, 4401 * MiB, seconds(10)), "a budget more than 10% above the reported one is not due after 10 s");
+    Require(SampledBudgetReportDue(4000 * MiB, 3599 * MiB, seconds(10)), "a budget more than 10% below the reported one is not due after 10 s");
+    Require(!SampledBudgetReportDue(4000 * MiB, 2048 * MiB, seconds(9)), "a budget change is reported again within 10 s of the last report");
+}
+
 void misalignedShaderDataTests() {
     mock = MockVulkan{};
     auto context = mockContext();
@@ -1779,6 +1870,7 @@ struct ModuleShape {
     bool layer = false;
     bool fragDepth = false;
     std::uint32_t sampleMaskLength = 0;
+    std::uint32_t floatControlsWidth = 0;
 };
 
 void emit(std::vector<std::uint32_t>& out, spv::Op op, std::initializer_list<std::uint32_t> operands) {
@@ -1965,6 +2057,9 @@ std::vector<std::uint32_t> makeModule(const ModuleShape& shape) {
     if (shape.fragmentMode) emit(words, spv::OpExecutionMode, {main, *shape.fragmentMode});
     if (shape.fragment) emit(words, spv::OpExecutionMode, {main, spv::ExecutionModeOriginUpperLeft});
     if (shape.fragDepth) emit(words, spv::OpExecutionMode, {main, spv::ExecutionModeDepthReplacing});
+    if (shape.floatControlsWidth != 0) {
+        for (const auto mode : {spv::ExecutionModeRoundingModeRTE, spv::ExecutionModeDenormPreserve, spv::ExecutionModeSignedZeroInfNanPreserve}) emit(words, spv::OpExecutionMode, {main, mode, shape.floatControlsWidth});
+    }
     words.insert(words.end(), annotations.begin(), annotations.end());
     words.insert(words.end(), declarations.begin(), declarations.end());
     words.insert(words.end(), function.begin(), function.end());
@@ -2352,6 +2447,23 @@ void ConservativeRasterizationTests() {
     }
 }
 
+void floatControlsModeTests() {
+    AgcDriver::Graphics::State state{};
+    state.stages.path = AgcDriver::Graphics::ShaderPath::Vertex;
+    ShaderRecompiler::RecompileResult vertex;
+    ShaderRecompiler::RecompileResult pixel;
+    const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &pixel, 0}}};
+    const VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+    for (const auto width : {16u, 32u, 64u}) {
+        vertex.spirv = makeModule({.floatControlsWidth = width});
+        pixel.spirv = makeModule({.fragment = true, .floatControlsWidth = width});
+        AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false);
+    }
+    vertex.spirv = makeModule({.floatControlsWidth = 8u});
+    pixel.spirv = makeModule({.fragment = true});
+    expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false); }, "float controls execution modes");
+}
+
 void pixelParameterSlotTests() {
     using AgcDriver::Graphics::CompiledShader;
     const VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
@@ -2499,6 +2611,15 @@ void validationTests() {
         const VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
         expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false); }, "unsupported device capability");
         AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false, false, true);
+    }
+    {
+        ShaderRecompiler::RecompileResult vertex;
+        vertex.spirv = makeModule({});
+        vertex.spirv.insert(vertex.spirv.begin() + 5, {(2u << 16u) | spv::OpCapability, static_cast<std::uint32_t>(spv::CapabilityInt64Atomics)});
+        const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+        const VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+        expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false); }, "unsupported device capability 12");
+        AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false, false, false, false, false, true);
     }
     for (const auto capability : {spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformShuffle}) {
         ShaderRecompiler::RecompileResult vertex;
@@ -2715,8 +2836,10 @@ void vertexCopyTests() {
 int main() {
 #ifdef _WIN32
     _putenv_s("APS5_PIN_WAIT_MS", "200");
+    _putenv_s("APS5_HEAP_MIRROR_MIB", "4");
 #else
     setenv("APS5_PIN_WAIT_MS", "200", 1);
+    setenv("APS5_HEAP_MIRROR_MIB", "4", 1);
 #endif
     try {
         {
@@ -2766,6 +2889,7 @@ int main() {
         ReversedComponentOrderTests();
         metadataPassTests();
         cmaskTests();
+        uint16ExportTests();
         ShaderStageTests();
         TuningFieldTests();
         PixelInputLayoutTests();
@@ -2776,12 +2900,16 @@ int main() {
         descriptorCacheTests();
         misalignedShaderDataTests();
         debugBranchTests();
+        textureCacheBudgetTests();
+        sampledTextureBudgetTests();
+        sampledBudgetReportTests();
         meshArgumentTests();
         meshIndexBufferTests();
         validationTests();
         vertexCopyTests();
         pixelParameterSlotTests();
         rectListTests();
+        floatControlsModeTests();
         mock = MockVulkan{};
         auto bdaContext = mockContext();
         bdaContext.bufferDeviceAddress = true;
@@ -2798,7 +2926,11 @@ int main() {
                 const auto offset = address - 0x100000000000ULL;
                 const auto buffer = reinterpret_cast<VkBuffer>(offset / 0x10000);
                 return std::span<std::byte>(mock.memories.at(mock.bufferMemory.at(buffer))).subspan(offset % 0x10000);
-            }
+            },
+            [](std::optional<VkDeviceSize> headroom) {
+                mock.memoryLimit = headroom.has_value() ? std::optional<VkDeviceSize>(mock.allocatedBytes + *headroom) : std::nullopt;
+            },
+            [] { return mock.allocationAttempts; }
         });
         Require(mock.live == 0, "BDA resources leaked Vulkan objects");
         RunGuestAllocationTests();

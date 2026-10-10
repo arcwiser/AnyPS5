@@ -14,6 +14,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include "prx/libc/include/general/VabiMacros.hpp"
 #include "ResidentPresent.hpp"
 #include "SampleLod_spv.h"
 #include "SampleArray_spv.h"
@@ -41,6 +42,13 @@
 #include <vector>
 
 namespace {
+
+extern "C" {
+int APS5_VABI sceKernelAllocateDirectMemory(std::int64_t, std::int64_t, std::size_t, std::size_t, int, std::int64_t*);
+int APS5_VABI sceKernelMapDirectMemory(void**, std::size_t, int, int, std::int64_t, std::size_t);
+int APS5_VABI sceKernelReleaseDirectMemory(std::int64_t, std::size_t);
+int APS5_VABI sceKernelMunmap(void*, std::size_t);
+}
 
 using namespace AgcDriver::Graphics;
 using AgcDriver::GuestMemory::GpuMutex;
@@ -323,6 +331,49 @@ void completionCountTests(const Device& device, Recorder& recorder) {
     Require(ran == 1 && Recorder::PendingCompletionLabels() == 0 && Recorder::PendingWriteBackCompletions() == 0 && recorder.Idle(), "counts did not return to 0 at finish");
     const bool storeAlways = std::getenv("APS5_LABEL_STORE_ALWAYS") != nullptr;
     Require(memory[0] == 1 && memory[2] == (storeAlways ? 1u : 7u) && memory[16] == 1, "completion stores ran for the wrong labels (overlapped and not-imported ones store, the untouched GPU-stored one skips)");
+}
+
+void directCompletionLabelTests(Recorder& recorder) {
+    using namespace AgcDriver::GuestMemory;
+    constexpr std::size_t size = 65536;
+    struct Release {
+        Recorder& recorder;
+        void* mapping = nullptr;
+        std::int64_t physical = -1;
+        ~Release() {
+            recorder.Sync();
+            if (mapping != nullptr) sceKernelMunmap(mapping, size);
+            if (physical >= 0) sceKernelReleaseDirectMemory(physical, size);
+        }
+    } release{recorder};
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, size, size, 0, &release.physical) == 0, "allocate completion label backing");
+    Require(sceKernelMapDirectMemory(&release.mapping, size, 3, 0, release.physical, size) == 0, "map completion label backing");
+    auto* memory = static_cast<std::byte*>(release.mapping);
+    std::memset(memory, 7, size);
+    const auto address = reinterpret_cast<std::uint64_t>(memory) + 4092;
+    std::array<std::byte, 16> value;
+    for (const auto bytes : {4u, 8u, 16u}) {
+        value.fill(static_cast<std::byte>(bytes));
+        const auto before = CollectWritesUncached(address, bytes);
+        recorder.NotePendingWrite(address, bytes);
+        recorder.AfterCompletions(address, std::span(value).first(bytes), 100 + bytes, 0, false);
+        value.fill(std::byte{99});
+        bool observed = false;
+        Require(recorder.AfterRecordedWork([&] {
+            observed = std::all_of(memory + 4092, memory + 4092 + bytes, [bytes](auto b) { return b == static_cast<std::byte>(bytes); });
+        }), "completion observer was not recorded");
+        recorder.Sync();
+        Require(observed, "a following completion observed incorrect label bytes");
+        Require(memory[4091] == std::byte{7} && memory[4108] == std::byte{7}, "completion label changed neighboring bytes");
+        Require(recorder.Idle() && Recorder::PendingCompletionLabels() == 0, "completion label remained pending after sync");
+        if (before != 0) {
+            Require(StoredOver(address, bytes, before), "completion label was not stamped");
+            Require(UnchangedSinceCollected(address, bytes, before), "completion label dirtied the guest page");
+            const auto after = CollectWritesUncached(address, bytes);
+            memory[4092] = std::byte{81};
+            Require(!UnchangedSinceCollected(address, bytes, after), "completion store disabled subsequent guest tracking");
+        }
+    }
 }
 
 void afterRecordedWorkTests(const Device& device, Recorder& recorder) {
@@ -1057,6 +1108,93 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
     HostImportFor(context, address, bytes);
 }
 
+void misalignedRegionTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    const auto alignment = context.limits.minStorageBufferOffsetAlignment;
+    constexpr std::size_t bytes = 65536;
+    if (alignment < 8 || alignment > 256) {
+        std::cout << "storage buffer offset alignment " << alignment << ": misaligned draw regions not tested\n";
+        return;
+    }
+    void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
+    if (block == nullptr) {
+        std::cout << "host imports or write watching unavailable: misaligned draw regions not tested\n";
+        return;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    auto* guest = static_cast<std::uint8_t*>(block);
+    for (std::size_t at = 0; at < bytes; ++at) guest[at] = static_cast<std::uint8_t>(at * 5u + 1u);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } unregister{context, block};
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr) {
+        std::cout << "host import of the watched block refused: misaligned draw regions not tested\n";
+        return;
+    }
+    constexpr std::uint32_t offset = 4096 + 4;
+    constexpr std::size_t elementBytes = 64;
+    const auto view = address + offset;
+    Require((view - import->base) % alignment != 0 && (view - import->base) % 4 == 0, "the test view is not a DWORD-aligned view off the storage buffer offset alignment");
+    ShaderRecompiler::RecompileResult vertex;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+    binding.descriptorSet = 0;
+    binding.binding = 0;
+    binding.count = 1;
+    binding.guestDescriptor = {static_cast<std::uint32_t>(view), static_cast<std::uint32_t>(view >> 32u) & 0xffffu, static_cast<std::uint32_t>(elementBytes), 0x31000000u};
+    binding.bufferWritten = {false};
+    vertex.bindings.push_back(binding);
+    vertex.pushConstants.resize(16);
+    vertex.memoryOffsetDword = 0;
+    const ShaderRecompiler::RecompileResult fragment;
+    {
+        auto regionContext = context;
+        DescriptorCache cache(regionContext);
+        regionContext.descriptorCache = &cache;
+        Recorder regionRecorder(regionContext);
+        regionRecorder.Activate();
+        const ColorTarget target{};
+        ShaderResources resources(regionContext, vertex, fragment, target, 0, 0);
+        Require(resources.Reusable(), "a misaligned read-only draw region bound in place is not reusable");
+        const auto reads = resources.InPlaceReads();
+        Require(reads.size() == 1 && reads.front().first == view && reads.front().second == view + elementBytes, "the misaligned draw region is not read in place");
+        std::array<std::byte, PipelinePushConstantBytes> push{};
+        resources.PatchPushConstants(push);
+        const auto adjustment = static_cast<std::uint32_t>(push[0]);
+        Require(adjustment == (view - import->base) % alignment, "the misaligned region's push constant offset is not its distance from the aligned binding offset");
+        const auto check = [&] {
+            const auto bindings = resources.PrepareDrawBindings(regionRecorder);
+            Require(bindings != nullptr && bindings->snapshots.size() == 1, "the read-only misaligned draw input was not snapshotted");
+            const auto contents = bindings->snapshots.front().buffer->Bytes();
+            Require(bindings->snapshots.front().address == view - adjustment && contents.size() == adjustment + elementBytes, "the draw snapshot does not start at the aligned offset below the view");
+            Require(std::memcmp(contents.data() + adjustment, guest + offset, elementBytes) == 0, "the shader's patched offset into the draw snapshot misses the view's bytes");
+        };
+        check();
+        guest[offset + 8] ^= 0xffu;
+        check();
+        regionRecorder.Sync();
+    }
+    recorder.Activate();
+}
+
 void misalignedSnapshotTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     const auto alignment = context.limits.minStorageBufferOffsetAlignment;
@@ -1370,14 +1508,19 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
         mutation.Add(block, bytes, true, true);
     }
     struct Unregister {
+        const Context& context;
         void* block;
+        std::uint64_t address;
         bool armed = true;
         ~Unregister() {
             if (!armed) return;
-            GuestAllocations::Mutation mutation;
-            mutation.Remove(block);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
         }
-    } unregister{block};
+    } unregister{context, block, address};
     const auto* import = HostImportFor(context, address, bytes);
     if (import == nullptr) {
         std::cout << "host import of the shadow test block refused: unit shadows not tested\n";
@@ -2886,10 +3029,21 @@ int main(int argc, char** argv) {
             std::cout << "Single cube snapshot and storage sampling tests passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--completion-labels-only") {
+            completionCountTests(device, recorder);
+            afterRecordedWorkTests(device, recorder);
+            directCompletionLabelTests(recorder);
+            labelTests(recorder);
+            lateLabelTests(recorder);
+            largeLabelTests(recorder);
+            std::cout << "Completion label storage and ordering tests passed\n";
+            return 0;
+        }
         readTrackingTests(device, recorder);
         writeSettledTests(device, recorder);
         completionCountTests(device, recorder);
         afterRecordedWorkTests(device, recorder);
+        directCompletionLabelTests(recorder);
         batchStampTests(recorder);
         labelTests(recorder);
         lateLabelTests(recorder);
@@ -2899,6 +3053,7 @@ int main(int argc, char** argv) {
         keyProofTests(device, recorder);
         resourceReadTests(device, recorder);
         misalignedSnapshotTests(device, recorder);
+        misalignedRegionTests(device, recorder);
         drawSnapshotReuseTests(device, recorder);
         drawSnapshotEvictionTests(device);
         drawInputReuseTests(device, recorder);
